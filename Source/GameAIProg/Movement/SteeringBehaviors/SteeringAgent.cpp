@@ -28,8 +28,22 @@ void ASteeringAgent::Tick(float DeltaTime)
 
 	if (SteeringBehavior)
 	{
-		SteeringOutput output = SteeringBehavior->CalculateSteering(DeltaTime, *this);
-		AddMovementInput(FVector{output.LinearVelocity, 0.f});
+		SteeringOutput Output = SteeringBehavior->CalculateSteering(DeltaTime, *this);
+
+		// SteeringOutput.LinearVelocity passed to AddMovementInput; CharacterMovementComponent handles speed
+		if (!Output.LinearVelocity.IsNearlyZero())
+		{
+			AddMovementInput(FVector{ Output.LinearVelocity, 0.f });
+		}
+
+		// SteeringOutput.AngularVelocity applied by incrementing Yaw; allows behaviors like Face
+		// to control the agent's orientation independently of linear movement
+		if (!FMath::IsNearlyZero(Output.AngularVelocity))
+		{
+			FRotator CurrentRotation = GetActorRotation();
+			CurrentRotation.Yaw += Output.AngularVelocity;
+			SetActorRotation(CurrentRotation);
+		}
 	}
 }
 
@@ -43,4 +57,3 @@ void ASteeringAgent::SetSteeringBehavior(ISteeringBehavior* NewSteeringBehavior)
 {
 	SteeringBehavior = NewSteeringBehavior;
 }
-

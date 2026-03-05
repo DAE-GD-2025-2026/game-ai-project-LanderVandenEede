@@ -113,8 +113,8 @@ void ALevel_SteeringBehaviors::Tick(float DeltaTime)
 			ImGui::SameLine();
 			ImGui::PushItemWidth(100);
 
-			// Add the names of your steering behaviors
-			if (ImGui::Combo("", &a.SelectedBehavior, "Seek\0Wander\0Flee\0Arrive\0Evade\0Pursuit", 4))
+			// All steering behavior names in enum order: Seek, Wander, Flee, Arrive, Evade, Pursuit
+			if (ImGui::Combo("", &a.SelectedBehavior, "Seek\0Wander\0Flee\0Arrive\0Evade\0Pursuit\0"))
 			{
 				bBehaviourModified = true;
 			}
@@ -223,15 +223,46 @@ void ALevel_SteeringBehaviors::SetAgentBehavior(ImGui_Agent& Agent)
 {
 	Agent.Behavior.reset();
 
-	//switch (static_cast<BehaviorTypes>(Agent.SelectedBehavior))
-	//{
-	////TODO; Implement behaviors setting here
-	//default:
-	//	assert(false); // Incorrect Agent Behavior gotten during SetAgentBehavior()	
-	//}
+	switch (static_cast<BehaviorTypes>(Agent.SelectedBehavior))
+	{
+	case BehaviorTypes::Seek:
+		Agent.Behavior = std::make_unique<Seek>();
+		Agent.Agent->SetIsAutoOrienting(true);
+		break;
+
+	case BehaviorTypes::Wander:
+		Agent.Behavior = std::make_unique<Wander>();
+		Agent.Agent->SetIsAutoOrienting(true);
+		break;
+
+	case BehaviorTypes::Flee:
+		Agent.Behavior = std::make_unique<Flee>();
+		Agent.Agent->SetIsAutoOrienting(true);
+		break;
+
+	case BehaviorTypes::Arrive:
+		Agent.Behavior = std::make_unique<Arrive>();
+		Agent.Agent->SetIsAutoOrienting(true);
+		break;
+
+	case BehaviorTypes::Evade:
+		Agent.Behavior = std::make_unique<Evade>();
+		Agent.Agent->SetIsAutoOrienting(true);
+		break;
+
+	case BehaviorTypes::Pursuit:
+		Agent.Behavior = std::make_unique<Pursuit>();
+		Agent.Agent->SetIsAutoOrienting(true);
+		break;
+
+	default:
+		// Face: no linear movement, manual rotation — disable auto-orient
+		Agent.Behavior = std::make_unique<Face>();
+		Agent.Agent->SetIsAutoOrienting(false);
+		break;
+	}
 
 	UpdateTarget(Agent);
-
 	Agent.Agent->SetSteeringBehavior(Agent.Behavior.get());
 }
 
@@ -283,4 +314,3 @@ void ALevel_SteeringBehaviors::RefreshAgentTargets(unsigned int IndexRemoved)
 		}
 	}
 }
-
