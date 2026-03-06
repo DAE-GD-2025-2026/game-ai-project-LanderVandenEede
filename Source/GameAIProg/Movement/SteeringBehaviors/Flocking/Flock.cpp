@@ -1,5 +1,6 @@
 #include "Flock.h"
 #include "FlockingSteeringBehaviors.h"
+#include "Movement/SteeringBehaviors/SpacePartitioning/SpacePartitioning.h"
 #include "Shared/ImGuiHelpers.h"
 
 Flock::Flock(
@@ -14,21 +15,37 @@ Flock::Flock(
 	, pAgentToEvade{ pAgentToEvade }
 {
 	Agents.SetNum(FlockSize);
+	OldPositions.SetNum(FlockSize);
 
-	//max possible neighbors
+	
 	Neighbors.SetNum(FlockSize);
 
-	// Spawn all steeringActors at random positions within the world
+	// CellSpace: world is square centered on origin, size = WorldSize*2 each axis
+	float const GridSize = WorldSize * 2.f;
+	pCellSpace = std::make_unique<CellSpace>(pWorld, GridSize, GridSize, NrOfCellsX, NrOfCellsX, FlockSize);
+
+	// Spawn all actors, auto-tick disabled so Flock controls update order
+	FActorSpawnParameters SpawnParams;
+	SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+
 	for (int i = 0; i < FlockSize; ++i)
 	{
 		float const RandX = FMath::RandRange(-WorldSize, WorldSize);
 		float const RandY = FMath::RandRange(-WorldSize, WorldSize);
-		Agents[i] = pWorld->SpawnActor<ASteeringAgent>(AgentClass, FVector{ RandX, RandY, 90.f }, FRotator::ZeroRotator);
+
+		Agents[i] = pWorld->SpawnActor<ASteeringAgent>(AgentClass,
+			FVector{ RandX, RandY, 90.f }, FRotator::ZeroRotator, SpawnParams);
+
 		if (IsValid(Agents[i]))
-		Agents[i]->SetIsAutoOrienting(true);
+		{
+			Agents[i]->SetIsAutoOrienting(true);
+			Agents[i]->SetActorTickEnabled(false); // Flock manually ticks each agent
+			OldPositions[i] = Agents[i]->GetPosition();
+			pCellSpace->AddAgent(*Agents[i]);
+		}
 	}
 
-	// Create flocking behavior
+	// Create flocking behaviors, all take a Flock* for neighborhood access
 	pSeparationBehavior = new Separation(this);
 	pCohesionBehavior = new Cohesion(this);
 	pVelMatchBehavior = new VelocityMatch(this);
@@ -36,7 +53,7 @@ Flock::Flock(
 	pWanderBehavior = new Wander();
 	pEvadeBehavior = new EvadeWithRadius();
 
-	//weighted average of all flocking behaviors
+	// BlendedSteering: weighted average of all flocking behaviors
 	pBlendedSteering = std::make_unique<BlendedSteering>(std::vector<BlendedSteering::WeightedBehavior>{
 		{ pSeparationBehavior, WeightSeparation },
 		{ pCohesionBehavior,   WeightCohesion },
@@ -45,13 +62,12 @@ Flock::Flock(
 		{ pWanderBehavior,     WeightWander }
 	});
 
-	//evade the target agent when within radius, otherwise flock
+	// PrioritySteering: evade first, flock otherwise
 	pPrioritySteering = std::make_unique<PrioritySteering>(std::vector<ISteeringBehavior*>{
 		pEvadeBehavior,
 			pBlendedSteering.get()
 	});
 
-	// Assign PrioritySteering to every steeringAgent
 	for (ASteeringAgent* Agent : Agents)
 	{
 		if (IsValid(Agent))
@@ -67,11 +83,12 @@ Flock::~Flock()
 	delete pSeekBehavior;
 	delete pWanderBehavior;
 	delete pEvadeBehavior;
+	// pCellSpace cleaned up by unique_ptr
 }
 
 void Flock::Tick(float DeltaTime)
 {
-	// Update evade target from the evade agent's current state each tick
+	// Update evade target from the designated evade agent each tick
 	if (IsValid(pAgentToEvade) && pEvadeBehavior)
 	{
 		FTargetData EvadeTarget;
@@ -81,25 +98,129 @@ void Flock::Tick(float DeltaTime)
 		pEvadeBehavior->SetTarget(EvadeTarget);
 	}
 
-	for (ASteeringAgent* Agent : Agents)
+	for (int i = 0; i < Agents.Num(); ++i)
 	{
+		ASteeringAgent* Agent = Agents[i];
+
 		if (!IsValid(Agent)) continue;
 
 		RegisterNeighbors(Agent);
 		Agent->Tick(DeltaTime);
+
+		if (bUseSpatialPartitioning)
+			pCellSpace->UpdateAgentCell(*Agent, OldPositions[i]);
+		OldPositions[i] = Agent->GetPosition();
 	}
+}
+
+void Flock::RegisterNeighbors(ASteeringAgent* const pAgent)
+{
+	if (bUseSpatialPartitioning)
+	{
+		pCellSpace->RegisterNeighbors(*pAgent, NeighborhoodRadius);
+	}
+	else
+	{
+		NrOfNeighbors = 0;
+		FVector2D const AgentPos = pAgent->GetPosition();
+
+		for (ASteeringAgent* Other : Agents)
+		{
+			if (Other == pAgent || !IsValid(Other)) continue;
+
+			if (FVector2D::Distance(AgentPos, Other->GetPosition()) <= NeighborhoodRadius)
+			{
+				Neighbors[NrOfNeighbors] = Other;
+				++NrOfNeighbors;
+			}
+		}
+	}
+}
+
+int Flock::GetNrOfNeighbors() const
+{
+	return bUseSpatialPartitioning ? pCellSpace->GetNrOfNeighbors() : NrOfNeighbors;
+}
+
+const TArray<ASteeringAgent*>& Flock::GetNeighbors() const
+{
+	return bUseSpatialPartitioning ? pCellSpace->GetNeighbors() : Neighbors;
+}
+
+FVector2D Flock::GetAverageNeighborPos() const
+{
+	FVector2D Avg = FVector2D::ZeroVector;
+	int const N = GetNrOfNeighbors();
+	if (N == 0) return Avg;
+
+	const TArray<ASteeringAgent*>& Pool = GetNeighbors();
+	for (int i = 0; i < N; ++i)
+		Avg += Pool[i]->GetPosition();
+
+	return Avg / static_cast<float>(N);
+}
+
+FVector2D Flock::GetAverageNeighborVelocity() const
+{
+	FVector2D Avg = FVector2D::ZeroVector;
+	int const N = GetNrOfNeighbors();
+	if (N == 0) return Avg;
+
+	const TArray<ASteeringAgent*>& Pool = GetNeighbors();
+	for (int i = 0; i < N; ++i)
+		Avg += Pool[i]->GetLinearVelocity();
+
+	return Avg / static_cast<float>(N);
+}
+
+void Flock::SetTarget_Seek(FSteeringParams const& Target)
+{
+	if (pSeekBehavior)
+		pSeekBehavior->SetTarget(Target);
 }
 
 void Flock::RenderDebug()
 {
 	if (DebugRenderNeighborhood)
 		RenderNeighborhood();
+
+	if (bUseSpatialPartitioning && DebugRenderPartitions)
+		pCellSpace->RenderCells();
+}
+
+void Flock::RenderNeighborhood()
+{
+	// Only renders for the first agent
+	if (Agents.IsEmpty() || !IsValid(Agents[0])) return;
+
+	ASteeringAgent* const FirstAgent = Agents[0];
+	FVector const AgentWorldPos = FirstAgent->GetActorLocation();
+
+	// Neighborhood radius circle, white
+	DrawDebugCircle(pWorld, AgentWorldPos, NeighborhoodRadius, 32,
+		FColor::White, false, -1.f, 0, 2.f, FVector(0, 1, 0), FVector(1, 0, 0));
+
+	// Line to each neighbor, cyan
+	int const N = GetNrOfNeighbors();
+	const TArray<ASteeringAgent*>& Pool = GetNeighbors();
+	for (int i = 0; i < N; ++i)
+	{
+		if (IsValid(Pool[i]))
+			DrawDebugLine(pWorld, AgentWorldPos, Pool[i]->GetActorLocation(),
+				FColor::Cyan, false, -1.f, 0, 1.f);
+	}
+
+	// Bounding box of neighborhood query
+	if (bUseSpatialPartitioning)
+	{
+		FVector const BoxExtent{ NeighborhoodRadius, NeighborhoodRadius, 1.f };
+		DrawDebugBox(pWorld, AgentWorldPos, BoxExtent, FColor::Green, false, -1.f, 0, 2.f);
+	}
 }
 
 void Flock::ImGuiRender(ImVec2 const& WindowPos, ImVec2 const& WindowSize)
 {
 #ifdef PLATFORM_WINDOWS
-#pragma region UI
 	{
 		bool bWindowActive = true;
 		ImGui::SetNextWindowPos(WindowPos);
@@ -130,12 +251,28 @@ void Flock::ImGuiRender(ImVec2 const& WindowPos, ImVec2 const& WindowSize)
 		ImGui::Text("Flocking");
 		ImGui::Spacing();
 
-		// Debug rendering toggles
+		// Debug toggles
 		ImGui::Checkbox("Debug Neighborhood", &DebugRenderNeighborhood);
 		ImGui::Checkbox("Debug Steering", &DebugRenderSteering);
-
 		for (ASteeringAgent* Agent : Agents)
 			if (IsValid(Agent)) Agent->SetDebugRenderingEnabled(DebugRenderSteering);
+
+		// Spatial partitioning toggle, switches neighbor source at runtime
+		bool bSPToggle = bUseSpatialPartitioning;
+		if (ImGui::Checkbox("Spatial Partitioning", &bSPToggle) && bSPToggle != bUseSpatialPartitioning)
+		{
+			bUseSpatialPartitioning = bSPToggle;
+			if (bUseSpatialPartitioning)
+			{
+				// Rebuild cell registration from scratch when switching on
+				pCellSpace->EmptyCells();
+				for (ASteeringAgent* Agent : Agents)
+					if (IsValid(Agent)) pCellSpace->AddAgent(*Agent);
+			}
+		}
+
+		if (bUseSpatialPartitioning)
+			ImGui::Checkbox("Debug Partitions", &DebugRenderPartitions);
 
 		ImGui::Spacing();
 		ImGui::Separator();
@@ -144,123 +281,25 @@ void Flock::ImGuiRender(ImVec2 const& WindowPos, ImVec2 const& WindowSize)
 		ImGui::Text("Behavior Weights");
 		ImGui::Spacing();
 
-		// Neighborhood radius slider
 		ImGuiHelpers::ImGuiSliderFloatWithSetter("Neighborhood R", NeighborhoodRadius, 10.f, 500.f,
 			[this](float v) { NeighborhoodRadius = v; });
 
-		// Per-behavior weight sliders — update the BlendedSteering's weight list directly
 		ImGuiHelpers::ImGuiSliderFloatWithSetter("Separation", WeightSeparation, 0.f, 5.f,
-			[this](float v)
-			{
-				WeightSeparation = v;
-				if (float* w = pBlendedSteering->GetWeight(pSeparationBehavior)) *w = v;
-			}, "%.2f");
+			[this](float v) { WeightSeparation = v; if (float* w = pBlendedSteering->GetWeight(pSeparationBehavior)) *w = v; }, "%.2f");
 
 		ImGuiHelpers::ImGuiSliderFloatWithSetter("Cohesion", WeightCohesion, 0.f, 5.f,
-			[this](float v)
-			{
-				WeightCohesion = v;
-				if (float* w = pBlendedSteering->GetWeight(pCohesionBehavior)) *w = v;
-			}, "%.2f");
+			[this](float v) { WeightCohesion = v; if (float* w = pBlendedSteering->GetWeight(pCohesionBehavior)) *w = v; }, "%.2f");
 
 		ImGuiHelpers::ImGuiSliderFloatWithSetter("Alignment", WeightAlignment, 0.f, 5.f,
-			[this](float v)
-			{
-				WeightAlignment = v;
-				if (float* w = pBlendedSteering->GetWeight(pVelMatchBehavior)) *w = v;
-			}, "%.2f");
+			[this](float v) { WeightAlignment = v; if (float* w = pBlendedSteering->GetWeight(pVelMatchBehavior)) *w = v; }, "%.2f");
 
 		ImGuiHelpers::ImGuiSliderFloatWithSetter("Seek", WeightSeek, 0.f, 5.f,
-			[this](float v)
-			{
-				WeightSeek = v;
-				if (float* w = pBlendedSteering->GetWeight(pSeekBehavior)) *w = v;
-			}, "%.2f");
+			[this](float v) { WeightSeek = v; if (float* w = pBlendedSteering->GetWeight(pSeekBehavior)) *w = v; }, "%.2f");
 
 		ImGuiHelpers::ImGuiSliderFloatWithSetter("Wander", WeightWander, 0.f, 5.f,
-			[this](float v)
-			{
-				WeightWander = v;
-				if (float* w = pBlendedSteering->GetWeight(pWanderBehavior)) *w = v;
-			}, "%.2f");
+			[this](float v) { WeightWander = v; if (float* w = pBlendedSteering->GetWeight(pWanderBehavior)) *w = v; }, "%.2f");
 
 		ImGui::End();
 	}
-#pragma endregion
 #endif
-}
-
-void Flock::RenderNeighborhood()
-{
-	// Debug render: neighborhood radius circle and neighbor lines for the first agent only
-	if (Agents.IsEmpty() || !IsValid(Agents[0])) return;
-
-	ASteeringAgent* const FirstAgent = Agents[0];
-	FVector const AgentWorldPos = FirstAgent->GetActorLocation();
-
-	// Neighborhood radius circle
-	DrawDebugCircle(pWorld, AgentWorldPos, NeighborhoodRadius, 32,
-		FColor::White, false, -1.f, 0, 2.f, FVector(0, 1, 0), FVector(1, 0, 0));
-
-	// Line to each neighbor
-	for (int i = 0; i < NrOfNeighbors; ++i)
-	{
-		if (IsValid(Neighbors[i]))
-		{
-			DrawDebugLine(pWorld, AgentWorldPos, Neighbors[i]->GetActorLocation(),
-				FColor::Cyan, false, -1.f, 0, 1.f);
-		}
-	}
-}
-
-#ifndef GAMEAI_USE_SPACE_PARTITIONING
-void Flock::RegisterNeighbors(ASteeringAgent* const pAgent)
-{
-	NrOfNeighbors = 0;
-
-	FVector2D const AgentPos = pAgent->GetPosition();
-
-	for (ASteeringAgent* OtherAgent : Agents)
-	{
-		// Exclude the agent from its own neighborhood
-		if (OtherAgent == pAgent || !IsValid(OtherAgent)) continue;
-
-		float const Distance = FVector2D::Distance(AgentPos, OtherAgent->GetPosition());
-		if (Distance <= NeighborhoodRadius)
-		{
-			// Write directly into the pre-allocated slot — memory pool pattern
-			Neighbors[NrOfNeighbors] = OtherAgent;
-			++NrOfNeighbors;
-		}
-	}
-}
-#endif
-
-FVector2D Flock::GetAverageNeighborPos() const
-{
-	FVector2D AvgPosition = FVector2D::ZeroVector;
-	if (NrOfNeighbors == 0) return AvgPosition;
-
-	for (int i = 0; i < NrOfNeighbors; ++i)
-		AvgPosition += Neighbors[i]->GetPosition();
-
-	return AvgPosition / static_cast<float>(NrOfNeighbors);
-}
-
-FVector2D Flock::GetAverageNeighborVelocity() const
-{
-	FVector2D AvgVelocity = FVector2D::ZeroVector;
-	if (NrOfNeighbors == 0) return AvgVelocity;
-
-	for (int i = 0; i < NrOfNeighbors; ++i)
-		AvgVelocity += Neighbors[i]->GetLinearVelocity();
-
-	return AvgVelocity / static_cast<float>(NrOfNeighbors);
-}
-
-void Flock::SetTarget_Seek(FSteeringParams const& Target)
-{
-	// Forward the mouse target to the Seek behavior inside BlendedSteering
-	if (pSeekBehavior)
-		pSeekBehavior->SetTarget(Target);
 }

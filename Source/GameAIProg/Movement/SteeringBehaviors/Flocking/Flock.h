@@ -1,17 +1,14 @@
 ﻿#pragma once
 
-// Toggle this define to enable/disable spatial partitioning
-// #define GAMEAI_USE_SPACE_PARTITIONING
-
 #include "FlockingSteeringBehaviors.h"
 #include "Movement/SteeringBehaviors/SteeringAgent.h"
 #include "Movement/SteeringBehaviors/SteeringHelpers.h"
 #include "Movement/SteeringBehaviors/CombinedSteering/CombinedSteeringBehaviors.h"
 #include <memory>
 #include "imgui.h"
-#ifdef GAMEAI_USE_SPACE_PARTITIONING
-#include "../SpacePartitioning/SpacePartitioning.h"
-#endif
+
+
+class CellSpace;
 
 class Flock final
 {
@@ -30,13 +27,10 @@ public:
 	void RenderDebug();
 	void ImGuiRender(ImVec2 const& WindowPos, ImVec2 const& WindowSize);
 
-#ifdef GAMEAI_USE_SPACE_PARTITIONING
-	// Space partitioning neighbor accessors (next week)
-#else
+	// Neighbor accessors, return from CellSpace or flat pool depending on bUseSpatialPartitioning
 	void RegisterNeighbors(ASteeringAgent* const Agent);
-	int GetNrOfNeighbors() const { return NrOfNeighbors; }
-	const TArray<ASteeringAgent*>& GetNeighbors() const { return Neighbors; }
-#endif
+	int GetNrOfNeighbors() const;
+	const TArray<ASteeringAgent*>& GetNeighbors() const;
 
 	FVector2D GetAverageNeighborPos() const;
 	FVector2D GetAverageNeighborVelocity() const;
@@ -49,19 +43,18 @@ private:
 	int FlockSize{ 0 };
 	TArray<ASteeringAgent*> Agents{};
 
-#ifdef GAMEAI_USE_SPACE_PARTITIONING
-	// Space partitioning (next week)
-#else
-	// Memory pool: fixed-size array, NrOfNeighbors tracks how many slots are in use
+	// Old positions tracked per agent for UpdateAgentCell
+	TArray<FVector2D> OldPositions{};
+
+	// Flat neighbor memory pool (used when spatial partitioning is off)
 	TArray<ASteeringAgent*> Neighbors{};
-#endif
+	int NrOfNeighbors{ 0 };
 
 	float NeighborhoodRadius{ 200.f };
-	int NrOfNeighbors{ 0 };
 
 	ASteeringAgent* pAgentToEvade{ nullptr };
 
-	// Flocking behaviors — owned by Flock
+	// Flocking behaviors, owned by Flock
 	Separation* pSeparationBehavior{ nullptr };
 	Cohesion* pCohesionBehavior{ nullptr };
 	VelocityMatch* pVelMatchBehavior{ nullptr };
@@ -71,6 +64,11 @@ private:
 
 	std::unique_ptr<BlendedSteering>  pBlendedSteering{};
 	std::unique_ptr<PrioritySteering> pPrioritySteering{};
+
+	// Spatial partitioning, forward declared, allocated in Flock.cpp
+	std::unique_ptr<CellSpace> pCellSpace{};
+	bool bUseSpatialPartitioning{ false };
+	int NrOfCellsX{ 20 };
 
 	// BlendedSteering weights
 	float WeightSeparation{ 2.0f };
@@ -82,6 +80,7 @@ private:
 	// UI and rendering
 	bool DebugRenderSteering{ false };
 	bool DebugRenderNeighborhood{ true };
+	bool DebugRenderPartitions{ true };
 
 	void RenderNeighborhood();
 };
